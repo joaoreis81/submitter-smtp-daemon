@@ -1,75 +1,155 @@
-# SMTP Edge Proxy
+# Submitter SMTP Daemon
 
-A production-grade SMTP submission proxy with TLS termination, SNI support, per-user backend routing, and authenticated relay capabilities.
+A production-grade SMTP submission server (outbound MTA) with comprehensive authentication, message processing pipeline, delivery management, and observability features. Built with Go 1.24.
 
 ## Overview
 
-The SMTP Edge Proxy is a high-performance, feature-rich submission proxy designed to sit at the edge of your email infrastructure. It provides TLS termination with SNI-based multi-domain certificate selection, authenticates users against backend SMTP servers, and intelligently routes messages based on user or domain matching rules.
+The Submitter SMTP Daemon is a high-performance outbound SMTP server designed for authenticated email submission. It receives messages from authenticated clients (MUAs), processes them through a multi-stage pipeline, and delivers them to destination mail servers with robust retry logic and comprehensive event tracking.
 
 ### Key Features
 
-- **Multi-port TLS Support**: STARTTLS (port 587) and Implicit TLS (port 465)
-- **SNI-based Certificate Selection**: Host multiple domains on a single proxy
-- **Per-User/Domain Backend Routing**: Route different users to different backend servers
-- **Authenticated Connection Reuse**: Single authenticated connection per session
-- **Message Header Injection**: Track edge connection metadata (IP, user, TLS status)
-- **DSN Support**: Full RFC 3461 Delivery Status Notification forwarding
-- **Rate Limiting**: Per-IP and per-user failed authentication tracking
+- **Multi-port TLS Support**: STARTTLS (port 587) and Implicit TLS (port 465) with SNI
+- **Flexible Authentication**: Redis user database OR IP-based allowlist (CIDR support)
+- **8-Stage Message Pipeline**: tmp → incoming → parsed → filtered → modified → signed → delivering → done/failed
+- **Message Deduplication**: SHA256 hash-based duplicate detection with Redis
+- **Delivery Queue**: SQLite-based queue with configurable retry schedules
+- **Event Tracking**: Buffered ClickHouse logger for comprehensive analytics
+- **Rate Limiting**: Multi-level (per-IP, per-user, global) with Redis backing
+- **S3 Archival**: Message archival with date-based partitioning (configurable)
 - **Comprehensive Observability**: Prometheus metrics, structured JSON logging, health checks
-- **Hot Certificate Reload**: Update certificates without dropping connections
+- **DKIM Signing**: Per-domain DKIM signature support (Phase 3)
+- **Message Modification**: Header injection and content filtering (Phase 3)
 
-## Table of Contents
+## Architecture
 
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Backend Routing](#backend-routing)
-- [TLS and Certificates](#tls-and-certificates)
-- [Features](#features)
-- [Monitoring and Metrics](#monitoring-and-metrics)
-- [Deployment](#deployment)
-- [Troubleshooting](#troubleshooting)
-- [Architecture](#architecture)
-- [Development](#development)
-- [Possible Fixes/TODOs](#possible-fixestodos)
-- [Enhancement Suggestions](#enhancement-suggestions)
+### High-Level Flow
+
+```
+┌─────────────┐    ┌────────────────────┐    ┌───────────────┐    ┌────────────────┐
+│   Client    │───▶│  SMTP Submission   │───▶│  Processing   │───▶│    Delivery    │
+│  (MUA/App)  │    │   Server (587/465) │    │   Pipeline    │    │     Workers    │
+└─────────────┘    └────────────────────┘    └───────────────┘    └────────────────┘
+   Auth via              │                          │                      │
+   Redis or IP           ├─ TLS/SNI                ├─ Parse              ├─ MX Lookup
+                         ├─ Auth                   ├─ Dedup              ├─ SMTP Delivery
+                         ├─ Rate Limit             ├─ Filter             ├─ Retry Logic
+                         └─ Spool                  ├─ Modify             └─ Event Logging
+                                                   ├─ Sign
+                                                   └─ Queue
+```
+
+### 8-Stage Message Pipeline
+
+1. **tmp**: Initial write staging area
+2. **incoming**: Message accepted, metadata extracted
+3. **parsed**: MIME parsing completed
+4. **filtered**: Content filtering applied (anti-spam, policy)
+5. **modified**: Headers added/removed, content transformation
+6. **signed**: DKIM signature applied
+7. **delivering**: Active delivery attempts
+8. **done/failed**: Final state after delivery or permanent failure
+
+### Core Components (Phase 1 & 2 Completed)
+
+#### Phase 1: Foundation
+- **SMTP Server** (`internal/smtpserver/`): Multi-listener SMTP submission server with SASL auth
+- **Authentication** (`internal/auth/`): Redis user auth OR IP-based allowlist
+- **Rate Limiting** (`internal/ratelimit/`): Redis-backed multi-level rate limiting
+- **Spool** (`internal/spool/`): 8-stage atomic file-based message spooling
+- **TLS Manager** (`internal/tlsmgr/`): SNI-based certificate selection with hot reload
+- **Metrics** (`internal/metrics/`): 15+ Prometheus metrics
+- **Logger** (`internal/logger/`): Structured JSON logging with context
+
+#### Phase 2: Message Processing
+- **Parser** (`internal/parser/`): MIME message parsing and metadata extraction
+- **Deduplication** (`internal/dedup/`): SHA256 hash-based duplicate detection
+- **Database** (`internal/db/`): SQLite database for messages and queue
+- **Queue** (`internal/queue/`): Delivery queue with state management
+- **ClickHouse** (`internal/clickhouse/`): Buffered event logger for analytics
+- **Delivery Worker** (`internal/delivery/`): Parallel delivery with MX lookup and retry logic
+
+#### Phase 3: Advanced Features (Planned)
+- **DKIM Signing** (`internal/dkim/`): Per-domain DKIM signature
+- **S3 Archival** (`internal/archive/`): Message archival with date partitioning
+- **Message Modification** (`internal/modifier/`): Header and content transformation
+- **SPF/DKIM Validation**: Output validation for deliverability
 
 ## Quick Start
 
 ### Prerequisites
 
-- Go 1.24 or later
-- TLS certificates in .pem format (certificate + key in one file)
-- Access to backend SMTP server(s)
+- **Go 1.24+** (for building from source)
+- **Docker & Docker Compose** (recommended for infrastructure)
+- **TLS Certificates** in .pem format (certificate + key)
+- **Redis** (for auth and rate limiting)
+- **ClickHouse** (for event logging)
+- **SQLite** (embedded, no separate installation)
+
+### Infrastructure Setup
+
+Start Redis and ClickHouse with Docker Compose:
+
+```bash
+# Start infrastructure services
+docker-compose up -d
+
+# Check services are running
+docker-compose ps
+
+# View logs
+docker-compose logs -f
+```
 
 ### Build and Run
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd submission-proxy
+git clone https://github.com/joaoreis81/submitter-smtp-daemon.git
+cd submitter-smtp-daemon
 
 # Build the binary
 make build
 
-# Grant permission to bind to privileged ports (<1024)
-sudo setcap 'cap_net_bind_service=+ep' ./smtp-edge-proxy
+# Create configuration (see Configuration section)
+cp config.example.yaml config.yaml
+# Edit config.yaml with your settings
 
-# Run with default configuration
-./smtp-edge-proxy -config config.yaml
+# Initialize database schema
+sqlite3 data/queue.db < internal/db/schema.sql
+
+# Add test user to Redis
+redis-cli SET "user:test@example.com:password" "your-password-hash"
+
+# Grant permission to bind to privileged ports (<1024)
+sudo setcap 'cap_net_bind_service=+ep' ./submitter-smtp-daemon
+
+# Run the daemon
+./submitter-smtp-daemon -config config.yaml
 ```
 
-### Test the Proxy
+### Test the Daemon
 
 ```bash
-# Test STARTTLS connection
+# Test SMTP connectivity
 printf "EHLO test\r\nQUIT\r\n" | nc localhost 587
 
-# Test Implicit TLS connection
-openssl s_client -connect localhost:465 -servername mail.example.com
+# Send a test email (Python)
+python3 << 'EOF'
+import smtplib
+from email.message import EmailMessage
 
-# Send a test email (requires Python 3)
-python3 test-proxy-e2e.py
+msg = EmailMessage()
+msg['From'] = 'test@example.com'
+msg['To'] = 'recipient@example.com'
+msg['Subject'] = 'Test Message'
+msg.set_content('This is a test message.')
+
+with smtplib.SMTP('localhost', 587) as s:
+    s.starttls()
+    s.login('test@example.com', 'your-password')
+    s.send_message(msg)
+    print("Message sent successfully!")
+EOF
 ```
 
 ### Health Checks
@@ -78,168 +158,102 @@ python3 test-proxy-e2e.py
 # Liveness probe
 curl http://localhost:8080/healthz
 
-# Readiness probe (checks if certificates are loaded)
+# Readiness probe
 curl http://localhost:8080/readyz
 
 # Prometheus metrics
 curl http://localhost:9090/metrics
 ```
 
-## Installation
-
-### From Source
-
-**Requirements:**
-- Go 1.24+
-- Git
-
-```bash
-# Clone and build
-git clone <repository-url>
-cd submission-proxy
-make build
-
-# The binary will be created as ./smtp-edge-proxy
-```
-
-### Using Docker
-
-```bash
-# Build Docker image
-make docker-build
-
-# Run with Docker
-docker run --rm \
-  -p 587:587 \
-  -p 465:465 \
-  -p 8080:8080 \
-  -p 9090:9090 \
-  -v $(pwd)/certs:/certs:ro \
-  -v $(pwd)/config.yaml:/config/config.yaml:ro \
-  -v $(pwd)/backends.csv:/backends.csv:ro \
-  smtp-edge-proxy
-```
-
-### System Service (systemd)
-
-```bash
-# Copy binary to system location
-sudo cp smtp-edge-proxy /usr/local/bin/
-
-# Create service file
-sudo tee /etc/systemd/system/smtp-edge-proxy.service > /dev/null <<EOF
-[Unit]
-Description=SMTP Edge Proxy
-After=network.target
-
-[Service]
-Type=simple
-User=smtp-proxy
-Group=smtp-proxy
-ExecStart=/usr/local/bin/smtp-edge-proxy -config /etc/smtp-edge-proxy/config.yaml
-Restart=on-failure
-RestartSec=5s
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/smtp-edge-proxy
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable smtp-edge-proxy
-sudo systemctl start smtp-edge-proxy
-sudo systemctl status smtp-edge-proxy
-```
-
 ## Configuration
 
-Configuration is managed through a YAML file. See `configs/config.example.yaml` for a complete reference.
+Configuration is managed through a YAML file with environment variable overrides. See `config.example.yaml` for complete reference.
 
 ### Basic Configuration
 
-Create a `config.yaml` file:
-
 ```yaml
-# Listener configuration
-listeners:
-  submission: ":587"  # STARTTLS port
-  smtps: ":465"       # Implicit TLS port
+server:
+  hostname: "mail.example.com"
 
-# TLS configuration
-tls:
-  min_version: "1.2"
-  certs_dir: "certs"
-  prefer_server_cipher: true
-
-# Backend server (default/fallback)
-backend:
-  backends_file: "backends.csv"
-  host: "mail.backend.example.com"
-  port: 587
-  use_starttls: false  # See Known Issues
-  timeout: 10s
-  relay_timeout: 30s
-
-# SMTP capabilities
 smtp:
-  banner_hostname: "edge-smtp.example.com"
-  require_tls: false
-  allow_insecure_auth: false
-  capabilities:
-    dsn: true
-    smtputf8: false
-    binary_mime: false
-    size_limit: 150000000  # 150MB
-
-# Security settings
-security:
-  rate_limit_enabled: true
-  rate_limit_per_ip: 10      # Failed auths per IP
-  rate_limit_per_user: 100   # Failed auths per user
-  rate_limit_window: 1m
-  ip_allow_list: []          # Empty = allow all
-  ip_deny_list: []
-
-# Connection limits
-limits:
-  max_recipients: 20
+  listeners:
+    - addr: ":587"
+      implicit_tls: false  # STARTTLS
+    - addr: ":465"
+      implicit_tls: true   # Implicit TLS
   read_timeout: 120s
   write_timeout: 120s
-  idle_timeout: 300s
+  max_message_size: 52428800  # 50MB
+  max_recipients: 50
 
-# Observability
+tls:
+  certs_dir: "certs"
+  min_version: "1.2"
+  prefer_server_cipher: true
+
+auth:
+  method: "redis"  # or "ip"
+  redis:
+    enabled: true
+    addresses: ["localhost:6379"]
+    db: 0
+    key_prefix: "user:"
+  ip_allowlist:
+    enabled: false
+    allowed_ips: []
+
+rate_limit:
+  enabled: true
+  user_messages_per_hour: 100
+  user_recipients_per_hour: 500
+  ip_connections_per_minute: 20
+  ip_failed_auth_per_hour: 10
+  global_messages_per_second: 50
+  global_concurrent_connections: 1000
+
+spool:
+  base_path: "/var/spool/submitter-smtp"
+  fsync: true
+  cleanup:
+    enabled: true
+    interval: 1h
+    retention_done: 24h
+    retention_failed: 168h  # 7 days
+
+deduplication:
+  enabled: true
+  window: 1h
+
+database:
+  path: "data/queue.db"
+  max_connections: 10
+
+delivery:
+  workers: 10
+  poll_interval: 5s
+  max_attempts: 5
+  retry_schedule:
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+    - 24h
+
+clickhouse:
+  addresses: ["http://localhost:8123"]
+  database: "submitter"
+  username: "default"
+  password: ""
+  buffer_size: 1000
+  flush_interval: 30s
+  compression: true
+
 observability:
-  log_level: "info"       # debug, info, warn, error
+  log_level: "info"
   log_format: "json"
   metrics_enabled: true
   metrics_addr: ":9090"
   health_addr: ":8080"
-```
-
-### Multiple Listeners
-
-The proxy supports binding to multiple addresses and interfaces:
-
-```yaml
-listeners:
-  listeners:
-    - addr: ":587"              # All interfaces, STARTTLS
-      implicit_tls: false
-    - addr: ":465"              # All interfaces, Implicit TLS
-      implicit_tls: true
-    - addr: "127.0.0.1:2587"    # IPv4 localhost only
-      implicit_tls: false
-    - addr: "[::1]:3587"        # IPv6 localhost only
-      implicit_tls: false
-    - addr: "192.168.1.10:587"  # Specific IP address
-      implicit_tls: false
 ```
 
 ### Environment Variable Overrides
@@ -247,71 +261,171 @@ listeners:
 Any configuration option can be overridden using environment variables:
 
 ```bash
-export SMTP_BACKEND_HOST="mail.example.com"
-export SMTP_BACKEND_PORT="587"
+export SMTP_SERVER_HOSTNAME="mail.example.com"
+export SMTP_RATE_LIMIT_USER_MESSAGES_PER_HOUR="200"
 export SMTP_LOG_LEVEL="debug"
-./smtp-edge-proxy -config config.yaml
+./submitter-smtp-daemon -config config.yaml
 ```
 
 Environment variable format: `SMTP_<SECTION>_<KEY>` (uppercase, underscores)
 
-## Backend Routing
+## Authentication
 
-The proxy supports sophisticated per-user and per-domain backend routing through a CSV configuration file.
+The daemon supports two authentication methods:
 
-### backends.csv Format
+### Redis-Based Authentication
 
-```csv
-auth_selector,backend_host,backend_port,use_starttls,implicit_tls,skip_tls_verify,timeout,relay_timeout,active
-user@example.com,mail1.backend.com,587,false,false,false,10s,30s,1
-@domain.tld,mail2.backend.com,465,false,true,false,10s,30s,1
-@company.net,mail3.backend.com,587,true,false,false,15s,45s,1
+Users stored in Redis with password hashes:
+
+```bash
+# Add user (bcrypt hash recommended)
+redis-cli SET "user:john@example.com:password" "$2a$10$..."
+
+# Add user with metadata
+redis-cli HSET "user:john@example.com" password "$2a$10$..." \
+  name "John Doe" quota "1000" enabled "true"
+
+# Remove user
+redis-cli DEL "user:john@example.com:password"
 ```
 
-### Field Descriptions
-
-- **auth_selector**: Match pattern
-  - `user@example.com` - Exact email match (highest priority)
-  - `@domain.tld` - Domain match (medium priority)
-  - Empty or missing - Falls back to default backend in config.yaml
-- **backend_host**: Backend SMTP server hostname or IP
-- **backend_port**: Backend port (587=submission, 465=smtps, 25=smtp)
-- **use_starttls**: `true` to upgrade with STARTTLS, `false` for plain/implicit TLS
-- **implicit_tls**: `true` for implicit TLS (SMTPS), `false` otherwise
-- **skip_tls_verify**: `true` to skip certificate verification (use for self-signed certs)
-- **timeout**: Connection timeout (e.g., "10s", "30s")
-- **relay_timeout**: Message relay timeout
-- **active**: `1` to enable, `0` to disable this route
-
-### Routing Priority
-
-1. **Exact email match**: `user@example.com` (highest priority)
-2. **Domain match**: `@example.com`
-3. **Default backend**: From `config.yaml` (fallback)
-
-### Example Configuration
-
-```csv
-auth_selector,backend_host,backend_port,use_starttls,implicit_tls,skip_tls_verify,timeout,relay_timeout,active
-admin@example.com,mail-admin.internal,587,false,false,true,10s,30s,1
-@vip-domain.com,mail-premium.internal,465,false,true,false,10s,30s,1
-@example.com,mail.backend.com,587,false,false,false,10s,30s,1
+**Configuration:**
+```yaml
+auth:
+  method: "redis"
+  redis:
+    enabled: true
+    addresses: ["localhost:6379"]
+    key_prefix: "user:"
 ```
 
-In this example:
-- `admin@example.com` routes to `mail-admin.internal`
-- All `@vip-domain.com` users route to `mail-premium.internal` via implicit TLS
-- Other `@example.com` users route to `mail.backend.com`
-- Users from other domains use the default backend from `config.yaml`
+### IP-Based Authentication
 
-## TLS and Certificates
+Allow specific IPs or CIDR ranges without password:
 
-### Certificate Format
+```yaml
+auth:
+  method: "ip"
+  ip_allowlist:
+    enabled: true
+    allowed_ips:
+      - "192.168.1.0/24"    # Local network
+      - "10.0.0.5"          # Specific server
+      - "2001:db8::/32"     # IPv6 range
+```
+
+**Use cases:**
+- Internal application servers
+- Trusted relay hosts
+- Development/testing environments
+
+## Features
+
+### Message Processing Pipeline
+
+#### 1. Acceptance Phase
+- TLS/SSL connection established with SNI support
+- SASL authentication (PLAIN, LOGIN)
+- Rate limiting checks (IP, user, global)
+- Message spooled to `tmp` → `incoming` stage
+
+#### 2. Parsing Phase
+- MIME message parsing
+- Metadata extraction (From, To, Subject, Date, Message-ID)
+- Header analysis
+- Content-Type detection
+
+#### 3. Deduplication Phase
+- SHA256 hash calculation of message body
+- Redis lookup for duplicate detection
+- Configurable deduplication window (default: 1 hour)
+- Links duplicate to original message ID
+
+#### 4. Queueing Phase
+- Message stored in SQLite database
+- Per-recipient delivery queue entries created
+- Initial delivery attempt scheduled
+- State: `queued` → `pending` → `delivering` → `delivered`/`perm_fail`
+
+#### 5. Delivery Phase
+- Parallel worker pool (configurable workers)
+- MX record lookup for recipient domain
+- SMTP delivery to destination server
+- Temporary failure handling with retry schedule
+- Permanent failure detection (5xx SMTP codes)
+- ClickHouse event logging
+
+### Delivery States
+
+| State | Description |
+|-------|-------------|
+| `queued` | Initial state after queueing |
+| `pending` | Waiting for retry (next_attempt set) |
+| `delivering` | Currently being delivered |
+| `delivered` | Successfully delivered |
+| `temp_fail` | Temporary failure, will retry |
+| `perm_fail` | Permanent failure, no more retries |
+
+### Retry Schedule
+
+Default retry schedule (configurable):
+
+```
+Attempt 1: Immediate
+Attempt 2: +5 minutes
+Attempt 3: +15 minutes
+Attempt 4: +1 hour
+Attempt 5: +4 hours
+Attempt 6: +24 hours (final)
+```
+
+After max attempts exceeded, delivery marked as `perm_fail`.
+
+### Rate Limiting
+
+Multi-level rate limiting with Redis backing and in-memory fallback:
+
+**Per-User Limits:**
+- Messages per hour (default: 100)
+- Recipients per hour (default: 500)
+
+**Per-IP Limits:**
+- Connections per minute (default: 20)
+- Failed auth attempts per hour (default: 10)
+
+**Global Limits:**
+- Messages per second (default: 50)
+- Concurrent connections (default: 1000)
+
+Rate limit exceeded response:
+```
+450 4.7.1 Rate limit exceeded
+```
+
+### Message Deduplication
+
+SHA256-based deduplication with configurable window:
+
+```yaml
+deduplication:
+  enabled: true
+  window: 1h  # Detect duplicates within 1 hour
+```
+
+When duplicate detected:
+- Original message ID returned
+- Duplicate not queued for delivery
+- Event logged to ClickHouse
+- Metrics updated
+
+### TLS and Certificates
+
+#### Certificate Format
 
 Certificates must be in **HAProxy-compatible .pem format**: certificate and private key in a single file.
 
 ```bash
-# Create a certificate file
+# Create certificate file
 cat server.crt server.key > certs/mail.example.com.pem
 
 # Or use certbot
@@ -320,325 +434,262 @@ cat /etc/letsencrypt/live/mail.example.com/fullchain.pem \
     > certs/mail.example.com.pem
 ```
 
-### Certificate Directory Structure
+#### SNI Support
+
+Automatic certificate selection based on client's SNI hostname:
 
 ```
 certs/
 ├── mail.example.com.pem
-├── mail.another-domain.com.pem
 ├── smtp.company.net.pem
-└── ...
+└── mail.another-domain.com.pem
 ```
 
-### SNI (Server Name Indication) Support
+Client connects with SNI `mail.example.com` → uses `mail.example.com.pem`
 
-The proxy automatically selects the correct certificate based on the client's SNI hostname:
+#### Hot Certificate Reload
 
-1. Client connects and sends SNI hostname (e.g., `mail.example.com`)
-2. Proxy matches SNI hostname to certificate filename
-3. If no match found, uses the first loaded certificate as fallback
-
-### Hot Certificate Reload
-
-Certificates are monitored with `fsnotify` and automatically reloaded when modified:
+Certificates automatically reloaded when modified (fsnotify):
 
 ```bash
 # Update certificate (no restart needed)
 cat new-cert.crt new-key.key > certs/mail.example.com.pem
 
-# Or send SIGHUP to reload all certificates
-kill -HUP $(pidof smtp-edge-proxy)
+# Or send SIGHUP
+kill -HUP $(pidof submitter-smtp-daemon)
 ```
 
-**Note**: Active TLS connections are NOT dropped during reload. Only new connections use the updated certificates.
+Active connections are NOT dropped during reload.
 
-### TLS Configuration Options
-
-```yaml
-tls:
-  min_version: "1.2"           # Minimum TLS version (1.0, 1.1, 1.2, 1.3)
-  certs_dir: "certs"           # Certificate directory path
-  cipher_suites: []            # Empty = Go defaults (recommended)
-  prefer_server_cipher: true   # Prefer server cipher suite order
-```
-
-### Generating Self-Signed Certificates (Testing Only)
-
-```bash
-# Generate self-signed certificate
-openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout server.key -out server.crt \
-  -days 365 -subj "/CN=mail.example.com"
-
-# Combine into .pem format
-cat server.crt server.key > certs/mail.example.com.pem
-```
-
-## Features
-
-### SMTP Capabilities
-
-The proxy supports all modern SMTP extensions:
-
-#### Always Enabled (Not Configurable)
-- **PIPELINING**: Command pipelining for better performance
-- **SIZE**: Message size negotiation
-- **ENHANCEDSTATUSCODES**: RFC 3463 enhanced status codes
-- **8BITMIME**: 8-bit MIME content transfer
-- **CHUNKING**: BDAT chunking for large messages
-
-#### Configurable Capabilities
-- **DSN**: Delivery Status Notifications (RFC 3461)
-- **SMTPUTF8**: UTF-8 in email addresses (RFC 6531)
-- **BINARYMIME**: Binary MIME content (RFC 3030)
-- **AUTH PLAIN**: Plain authentication mechanism
-- **AUTH LOGIN**: Login authentication mechanism
-- **STARTTLS**: TLS upgrade on port 587
-
-### Delivery Status Notifications (DSN)
-
-Full RFC 3461 implementation with parameter validation and forwarding:
-
-**MAIL FROM Parameters:**
-- `RET=FULL` - Request full message in bounce
-- `RET=HDRS` - Request only headers in bounce
-- `ENVID=<string>` - Envelope identifier for tracking
-
-**RCPT TO Parameters:**
-- `NOTIFY=NEVER` - Never send notification
-- `NOTIFY=SUCCESS` - Notify on successful delivery
-- `NOTIFY=FAILURE` - Notify on delivery failure
-- `NOTIFY=DELAY` - Notify on delivery delay
-- `ORCPT=<address>` - Original recipient address
-
-Example:
-```smtp
-MAIL FROM:<sender@example.com> RET=FULL ENVID=abc123
-RCPT TO:<user@example.com> NOTIFY=SUCCESS,FAILURE
-```
-
-### Message Headers Added
-
-The proxy adds the following headers to all relayed messages for audit and tracking:
-
-| Header | Description | Example |
-|--------|-------------|---------|
-| `X-Original-Client-IP` | Client IP address | `192.168.1.100` |
-| `X-Original-Auth-User` | Authenticated username | `user@example.com` |
-| `X-Original-Server-Name` | Server hostname | `mail.example.com` |
-| `X-Original-EHLO` | Client EHLO hostname | `mail.client.com` |
-| `X-Edge-Received-TLS` | TLS used (boolean) | `true` or `false` |
-| `X-Secure-Conn` | Connection type | `STARTTLS`, `SSL`, or `false` |
-
-**Example headers in a relayed message:**
-```
-X-Original-Client-IP: 192.168.1.100
-X-Original-Auth-User: user@example.com
-X-Original-Server-Name: mail.example.com
-X-Edge-Received-TLS: true
-X-Secure-Conn: STARTTLS
-X-Original-EHLO: mail.client.com
-```
-
-### Rate Limiting
-
-Failed authentication attempts are tracked per-IP and per-user:
-
-```yaml
-security:
-  rate_limit_enabled: true
-  rate_limit_per_ip: 10      # Max failed auths per IP in window
-  rate_limit_per_user: 100   # Max failed auths per user in window
-  rate_limit_window: 1m      # Time window (e.g., 1m, 5m, 1h)
-```
-
-When limits are exceeded:
-- Client receives: `421 4.7.1 Too many failed authentication attempts`
-- Metrics counter incremented: `smtp_proxy_rate_limit_hits_total`
-- Event logged with request ID
-
-### IP Filtering
-
-Allow/deny lists support individual IPs and CIDR ranges:
-
-```yaml
-security:
-  # Allow only these IPs/ranges (empty = allow all)
-  ip_allow_list:
-    - "192.168.1.0/24"
-    - "10.0.0.5"
-
-  # Block these IPs/ranges
-  ip_deny_list:
-    - "192.0.2.0/24"    # TEST-NET-1
-    - "198.51.100.0/24" # TEST-NET-2
-```
-
-**Note**: If `ip_allow_list` is not empty, only IPs in the list are allowed. `ip_deny_list` is checked after allow list.
-
-### Security Features
-
-- **No AUTH before TLS**: Configurable requirement for TLS before authentication
-- **Credential Redaction**: Passwords never appear in logs
-- **Authenticated Relay Only**: Backend connection authenticated with user's credentials
-- **TLS Enforcement**: Optionally require TLS for all client connections
-- **Backend TLS Verification**: Configurable per-backend certificate validation
-
-## Monitoring and Metrics
+## Monitoring and Observability
 
 ### Structured Logging
 
-All logs are output in JSON format with consistent fields:
+All logs in JSON format with consistent fields:
 
 ```json
 {
-  "time": "2025-10-07T13:40:02.305986098-03:00",
-  "level": "INFO",
-  "msg": "new session",
-  "request_id": "5899490e-66fc-4d4d-a0b3-3d15db65aebd",
-  "remote_addr": "[::1]:42542",
-  "client_ip": "::1",
-  "implicit_tls": true,
-  "tls_version": "TLS1.3",
-  "tls_cipher": "TLS_AES_128_GCM_SHA256",
-  "tls_server_name": "localhost"
+  "time": "2025-11-07T10:15:30.123Z",
+  "level": "info",
+  "component": "smtp-server",
+  "msg": "Message accepted and spooled",
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message_id": "c89f5e1a-7c4e-4d8b-9a3c-1e5d7f9b2c4a",
+  "client_ip": "192.168.1.100",
+  "auth_user": "john@example.com",
+  "message_size": 12345,
+  "recipients": 2
 }
 ```
 
 **Key log fields:**
-- `request_id`: Unique identifier for each session (tracks full transaction)
+- `session_id`: SMTP session identifier
+- `message_id`: Unique message identifier
 - `client_ip`: Client IP address
 - `auth_user`: Authenticated username
-- `backend`: Backend server used
-- `tls_type`: Connection encryption type (`STARTTLS`, `SSL`, `false`)
+- `component`: Component generating the log
 
-**Filter logs by request ID:**
+**Filter logs:**
 ```bash
-./smtp-edge-proxy -config config.yaml | jq 'select(.request_id=="5899490e-66fc-4d4d-a0b3-3d15db65aebd")'
-```
+# By message ID
+./submitter-smtp-daemon | jq 'select(.message_id=="c89f5e1a-...")'
 
-**Show only errors:**
-```bash
-./smtp-edge-proxy -config config.yaml | jq 'select(.level=="ERROR")'
+# By user
+./submitter-smtp-daemon | jq 'select(.auth_user=="john@example.com")'
+
+# Errors only
+./submitter-smtp-daemon | jq 'select(.level=="error")'
 ```
 
 ### Prometheus Metrics
 
-The proxy exports comprehensive Prometheus metrics on the configured metrics port (default: 9090).
+Comprehensive metrics exported on `:9090/metrics`:
 
-**Access metrics:**
-```bash
-curl http://localhost:9090/metrics
+#### Connection Metrics
 ```
-
-#### Key Metrics
-
-**Connection Metrics:**
-```
-smtp_proxy_current_connections - Active connections (gauge)
-smtp_proxy_connections_total - Total connections (counter)
-smtp_proxy_connection_duration_seconds - Connection duration histogram
+smtp_connections_total{port,tls_mode} - Total connections
+smtp_connections_current - Active connections (gauge)
+smtp_connection_duration_seconds{port} - Connection duration histogram
+smtp_connections_closed_total{port} - Closed connections
 ```
 
-**Authentication Metrics:**
+#### Authentication Metrics
 ```
-smtp_proxy_auth_success_total - Successful authentications (counter)
-smtp_proxy_auth_failures_total - Failed authentications (counter)
-smtp_proxy_auth_duration_seconds - Auth duration histogram
-```
-
-**Relay Metrics:**
-```
-smtp_proxy_relay_success_total - Successful message relays (counter)
-smtp_proxy_relay_failures_total - Failed message relays (counter)
-smtp_proxy_bytes_received_total - Bytes received from clients (counter)
-smtp_proxy_bytes_sent_total - Bytes sent to backends (counter)
+smtp_auth_attempts_total{method,result} - Auth attempts by method/result
+smtp_auth_duration_seconds{method} - Auth duration histogram
 ```
 
-**TLS Metrics:**
+#### Message Metrics
 ```
-smtp_proxy_tls_handshakes_total - TLS handshake count (counter)
-smtp_proxy_cert_reloads_total - Certificate reload count (counter)
+smtp_messages_accepted_total{user} - Messages accepted by user
+smtp_messages_rejected_total{reason} - Messages rejected by reason
+smtp_message_size_bytes{user} - Message size histogram
 ```
 
-**Rate Limiting Metrics:**
+#### Pipeline Metrics
 ```
-smtp_proxy_rate_limit_hits_total{type="ip"} - IP rate limit hits (counter)
-smtp_proxy_rate_limit_hits_total{type="user"} - User rate limit hits (counter)
+smtp_pipeline_stage_duration_seconds{stage} - Stage duration histogram
+smtp_messages_in_stage{stage} - Messages in each stage (gauge)
+```
+
+#### Delivery Metrics
+```
+smtp_delivery_attempts_total{result,mx_host} - Delivery attempts
+smtp_delivery_duration_seconds{result} - Delivery duration histogram
+```
+
+#### Queue Metrics
+```
+smtp_queue_size{state} - Queue size by state (gauge)
+```
+
+#### Rate Limiting Metrics
+```
+smtp_rate_limit_hits_total{type} - Rate limit hits by type
+```
+
+#### ClickHouse Metrics
+```
+smtp_clickhouse_buffer_size - Current buffer size (gauge)
+smtp_clickhouse_events_total{result} - Events logged
+smtp_clickhouse_flush_duration_seconds - Flush duration histogram
+```
+
+#### S3 Metrics
+```
+smtp_s3_uploads_total{result} - S3 upload attempts
+smtp_s3_upload_duration_seconds - Upload duration histogram
+```
+
+### ClickHouse Event Schema
+
+Comprehensive event tracking with buffered writes:
+
+```sql
+CREATE TABLE outbound_events (
+    event_id UUID,
+    event_time DateTime64(3),
+    msg_id String,
+    session_id String,
+
+    -- Connection
+    client_ip String,
+    client_port UInt16,
+    listener_port UInt16,
+
+    -- TLS
+    tls_version String,
+    tls_cipher String,
+    sni_hostname String,
+
+    -- Authentication
+    auth_user String,
+    auth_method String,
+    auth_result String,
+
+    -- Message
+    mail_from String,
+    rcpt_to Array(String),
+    message_size UInt32,
+    subject String,
+
+    -- Delivery
+    recipient String,
+    mx_hostname String,
+    mx_ip String,
+    smtp_code UInt16,
+    smtp_message String,
+    delivery_result String,
+    delivery_attempt UInt8,
+
+    -- Performance
+    stage String,
+    stage_duration UInt32,
+    total_duration UInt32
+) ENGINE = MergeTree()
+PARTITION BY toYYYYMM(event_time)
+ORDER BY (event_time, client_ip, auth_user, msg_id)
+TTL event_time + INTERVAL 90 DAY;
+```
+
+Query examples:
+
+```sql
+-- Delivery success rate by domain
+SELECT
+    domain,
+    countIf(delivery_result = 'success') * 100.0 / count() as success_rate
+FROM outbound_events
+WHERE delivery_result != ''
+  AND event_time >= now() - INTERVAL 1 DAY
+GROUP BY splitByChar('@', recipient)[2] as domain
+ORDER BY count() DESC
+LIMIT 10;
+
+-- Average delivery time by MX host
+SELECT
+    mx_hostname,
+    avg(delivery_duration) / 1000 as avg_delivery_seconds,
+    count() as deliveries
+FROM outbound_events
+WHERE delivery_result = 'success'
+  AND event_time >= now() - INTERVAL 1 HOUR
+GROUP BY mx_hostname
+ORDER BY deliveries DESC
+LIMIT 20;
+
+-- Top senders by volume
+SELECT
+    auth_user,
+    count(DISTINCT msg_id) as messages,
+    sum(arrayLength(rcpt_to)) as recipients,
+    sum(message_size) / 1024 / 1024 as total_mb
+FROM outbound_events
+WHERE stage = 'accepted'
+  AND event_time >= now() - INTERVAL 1 DAY
+GROUP BY auth_user
+ORDER BY messages DESC
+LIMIT 10;
 ```
 
 ### Health Endpoints
 
-**Liveness probe** (always returns 200 if running):
+**Liveness probe:**
 ```bash
 curl http://localhost:8080/healthz
-# Response: {"status":"ok"}
+# {"status":"ok"}
 ```
 
-**Readiness probe** (checks if certificates are loaded):
+**Readiness probe:**
 ```bash
 curl http://localhost:8080/readyz
-# Response: {"status":"ready","certificates_loaded":5}
-# or: {"status":"not ready","error":"no certificates loaded"}
+# {"status":"ready","checks":{"redis":"ok","clickhouse":"ok","database":"ok"}}
 ```
 
-**Prometheus metrics endpoint:**
+**Metrics endpoint:**
 ```bash
 curl http://localhost:9090/metrics
-```
-
-### Prometheus Integration Example
-
-Add to `prometheus.yml`:
-
-```yaml
-scrape_configs:
-  - job_name: 'smtp-edge-proxy'
-    static_configs:
-      - targets: ['localhost:9090']
-    scrape_interval: 15s
-```
-
-### Grafana Dashboard Queries
-
-**Authentication success rate:**
-```promql
-rate(smtp_proxy_auth_success_total[5m]) /
-  (rate(smtp_proxy_auth_success_total[5m]) + rate(smtp_proxy_auth_failures_total[5m]))
-```
-
-**Average relay duration:**
-```promql
-rate(smtp_proxy_relay_duration_seconds_sum[5m]) /
-  rate(smtp_proxy_relay_duration_seconds_count[5m])
-```
-
-**Active connections:**
-```promql
-smtp_proxy_current_connections
 ```
 
 ## Deployment
 
 ### Systemd Service
 
-Full systemd service example with security hardening:
-
 ```bash
-sudo tee /etc/systemd/system/smtp-edge-proxy.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/submitter-smtp-daemon.service > /dev/null <<'EOF'
 [Unit]
-Description=SMTP Edge Proxy
-Documentation=https://github.com/yourusername/submission-proxy
-After=network-online.target
+Description=Submitter SMTP Daemon
+Documentation=https://github.com/joaoreis81/submitter-smtp-daemon
+After=network-online.target redis.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=smtp-proxy
-Group=smtp-proxy
-WorkingDirectory=/opt/smtp-edge-proxy
-ExecStart=/usr/local/bin/smtp-edge-proxy -config /etc/smtp-edge-proxy/config.yaml
-ExecReload=/bin/kill -HUP \$MAINPID
+User=smtp
+Group=smtp
+WorkingDirectory=/opt/submitter-smtp-daemon
+ExecStart=/usr/local/bin/submitter-smtp-daemon -config /etc/submitter-smtp-daemon/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
@@ -646,14 +697,14 @@ TimeoutStopSec=30s
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=smtp-edge-proxy
+SyslogIdentifier=submitter-smtp-daemon
 
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/smtp-edge-proxy
+ReadWritePaths=/var/spool/submitter-smtp /var/lib/submitter-smtp-daemon
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -670,37 +721,36 @@ LimitNPROC=4096
 WantedBy=multi-user.target
 EOF
 
-# Create user
-sudo useradd -r -s /bin/false -d /opt/smtp-edge-proxy smtp-proxy
-
-# Create directories
-sudo mkdir -p /opt/smtp-edge-proxy/{certs,config}
-sudo mkdir -p /var/log/smtp-edge-proxy
-sudo chown -R smtp-proxy:smtp-proxy /opt/smtp-edge-proxy /var/log/smtp-edge-proxy
+# Create user and directories
+sudo useradd -r -s /bin/false -d /opt/submitter-smtp-daemon smtp
+sudo mkdir -p /opt/submitter-smtp-daemon/{certs,data}
+sudo mkdir -p /var/spool/submitter-smtp
+sudo mkdir -p /etc/submitter-smtp-daemon
+sudo chown -R smtp:smtp /opt/submitter-smtp-daemon /var/spool/submitter-smtp
 
 # Deploy files
-sudo cp smtp-edge-proxy /usr/local/bin/
-sudo cp config.yaml /etc/smtp-edge-proxy/
-sudo cp backends.csv /etc/smtp-edge-proxy/
-sudo cp certs/*.pem /opt/smtp-edge-proxy/certs/
+sudo cp submitter-smtp-daemon /usr/local/bin/
+sudo cp config.yaml /etc/submitter-smtp-daemon/
+sudo cp certs/*.pem /opt/submitter-smtp-daemon/certs/
+sudo chown -R smtp:smtp /opt/submitter-smtp-daemon/certs
 
 # Start service
 sudo systemctl daemon-reload
-sudo systemctl enable smtp-edge-proxy
-sudo systemctl start smtp-edge-proxy
+sudo systemctl enable submitter-smtp-daemon
+sudo systemctl start submitter-smtp-daemon
+sudo systemctl status submitter-smtp-daemon
 ```
 
 ### Docker Deployment
 
-**Using Docker Compose:**
-
 ```yaml
+# docker-compose.yml
 version: '3.8'
 
 services:
-  smtp-edge-proxy:
-    image: smtp-edge-proxy:latest
-    container_name: smtp-edge-proxy
+  submitter-smtp-daemon:
+    image: submitter-smtp-daemon:latest
+    container_name: submitter-smtp-daemon
     restart: unless-stopped
     ports:
       - "587:587"
@@ -709,113 +759,49 @@ services:
       - "9090:9090"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
-      - ./backends.csv:/backends.csv:ro
       - ./certs:/certs:ro
+      - spool-data:/var/spool/submitter-smtp
+      - queue-data:/data
     environment:
       - SMTP_LOG_LEVEL=info
+    depends_on:
+      - redis
+      - clickhouse
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:23-alpine
+    restart: unless-stopped
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./deployments/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+volumes:
+  spool-data:
+  queue-data:
+  redis-data:
+  clickhouse-data:
 ```
 
-**Run with Docker Compose:**
+Run with:
 ```bash
 docker-compose up -d
-docker-compose logs -f
-```
-
-### Kubernetes Deployment
-
-**Example deployment manifest:**
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: smtp-edge-proxy
-  namespace: mail-system
-spec:
-  replicas: 3
-  selector:
-    matchLabels:
-      app: smtp-edge-proxy
-  template:
-    metadata:
-      labels:
-        app: smtp-edge-proxy
-    spec:
-      containers:
-      - name: smtp-edge-proxy
-        image: smtp-edge-proxy:latest
-        ports:
-        - containerPort: 587
-          name: submission
-        - containerPort: 465
-          name: smtps
-        - containerPort: 8080
-          name: health
-        - containerPort: 9090
-          name: metrics
-        volumeMounts:
-        - name: config
-          mountPath: /config
-          readOnly: true
-        - name: backends
-          mountPath: /backends.csv
-          subPath: backends.csv
-          readOnly: true
-        - name: certs
-          mountPath: /certs
-          readOnly: true
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 10
-          periodSeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: 8080
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        resources:
-          requests:
-            memory: "128Mi"
-            cpu: "100m"
-          limits:
-            memory: "512Mi"
-            cpu: "500m"
-      volumes:
-      - name: config
-        configMap:
-          name: smtp-edge-proxy-config
-      - name: backends
-        configMap:
-          name: smtp-edge-proxy-backends
-      - name: certs
-        secret:
-          secretName: smtp-tls-certs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: smtp-edge-proxy
-  namespace: mail-system
-spec:
-  type: LoadBalancer
-  selector:
-    app: smtp-edge-proxy
-  ports:
-  - name: submission
-    port: 587
-    targetPort: 587
-  - name: smtps
-    port: 465
-    targetPort: 465
+docker-compose logs -f submitter-smtp-daemon
 ```
 
 ## Troubleshooting
@@ -831,303 +817,88 @@ listen tcp :587: bind: permission denied
 
 **Solution:**
 ```bash
-# Grant capability to bind privileged ports
-sudo setcap 'cap_net_bind_service=+ep' ./smtp-edge-proxy
-
-# Verify
-getcap ./smtp-edge-proxy
-# Should show: ./smtp-edge-proxy = cap_net_bind_service+ep
+sudo setcap 'cap_net_bind_service=+ep' ./submitter-smtp-daemon
 ```
 
-#### 2. Backend Authentication Timeout
+#### 2. Redis Connection Failed
 
 **Error in logs:**
 ```json
-{"level":"ERROR","msg":"backend auth failed","error":"timeout"}
+{"level":"error","component":"auth","msg":"Redis connection failed"}
 ```
 
 **Solutions:**
+1. Check Redis is running: `redis-cli ping`
+2. Verify Redis address in config.yaml
+3. Check Redis authentication if enabled
+4. Test connection: `redis-cli -h localhost -p 6379 ping`
 
-**Option 1:** Disable STARTTLS for backend (recommended workaround)
-```yaml
-backend:
-  use_starttls: false  # Use plain connection to backend
+#### 3. ClickHouse Connection Failed
+
+**Solution:**
+```bash
+# Check ClickHouse is running
+curl http://localhost:8123/
+
+# Test query
+echo "SELECT 1" | curl 'http://localhost:8123/' --data-binary @-
+
+# Check database exists
+echo "SHOW DATABASES" | curl 'http://localhost:8123/' --data-binary @-
 ```
 
-**Option 2:** Increase timeout
-```yaml
-backend:
-  timeout: 30s  # Increase from default 10s
+#### 4. Delivery Failures
+
+**Check delivery worker logs:**
+```bash
+./submitter-smtp-daemon | jq 'select(.component=="delivery")'
 ```
 
-**Option 3:** Use backend port 25 instead of 587
-```yaml
-backend:
-  port: 25  # Use SMTP port instead of submission
+**Check queue status:**
+```bash
+sqlite3 data/queue.db "SELECT state, COUNT(*) FROM delivery_queue GROUP BY state;"
 ```
 
-#### 3. Certificate Not Found
+**Common delivery issues:**
+- MX lookup failures → Check DNS resolution
+- Connection timeouts → Check firewall rules
+- Authentication errors → Check credentials
+- Rate limiting → Slow down sending rate
 
-**Error:**
-```json
-{"level":"WARN","msg":"no certificates found in directory","path":"certs"}
+#### 5. High Memory Usage
+
+**Check current metrics:**
+```bash
+curl http://localhost:9090/metrics | grep smtp_connections_current
+curl http://localhost:9090/metrics | grep smtp_clickhouse_buffer_size
 ```
 
 **Solutions:**
-
-1. Verify certificate directory exists:
-```bash
-ls -la certs/
-```
-
-2. Check certificate format (must be .pem):
-```bash
-# Certificates should end with .pem
-ls certs/*.pem
-```
-
-3. Verify certificate has both cert and key:
-```bash
-# Should show both BEGIN CERTIFICATE and BEGIN PRIVATE KEY
-cat certs/mail.example.com.pem
-```
-
-4. Check file permissions:
-```bash
-chmod 644 certs/*.pem
-```
-
-#### 4. SNI Certificate Selection Not Working
-
-**Issue:** Client always receives the same certificate regardless of SNI hostname.
-
-**Debug:**
-```bash
-# Test with specific SNI hostname
-openssl s_client -connect localhost:465 -servername mail.example.com -showcerts
-
-# Check which certificate is returned
-openssl s_client -connect localhost:465 -servername mail.example.com 2>/dev/null | \
-  openssl x509 -noout -subject -issuer
-```
-
-**Solution:** Ensure certificate filename matches SNI hostname:
-```
-# Correct naming
-certs/mail.example.com.pem
-
-# Incorrect naming
-certs/certificate.pem
-certs/ssl-cert.pem
-```
-
-#### 5. Rate Limiting Too Aggressive
-
-**Issue:** Legitimate users being rate limited.
-
-**Solution:** Adjust rate limiting parameters:
-```yaml
-security:
-  rate_limit_per_ip: 50      # Increase from default 10
-  rate_limit_per_user: 200   # Increase from default 100
-  rate_limit_window: 5m      # Increase window from 1m to 5m
-```
-
-Or disable rate limiting:
-```yaml
-security:
-  rate_limit_enabled: false
-```
-
-#### 6. High Memory Usage
-
-**Check current connections:**
-```bash
-curl http://localhost:9090/metrics | grep smtp_proxy_current_connections
-```
-
-**Monitor connection duration:**
-```bash
-./smtp-edge-proxy -config config.yaml | jq 'select(.msg=="connection closed")'
-```
-
-**Solutions:**
-
-1. Decrease idle timeout:
-```yaml
-limits:
-  idle_timeout: 60s  # Reduce from 300s
-```
-
-2. Implement connection limits (requires code changes - see TODOs)
-
-3. Use OS-level limits:
-```bash
-ulimit -n 4096  # Limit file descriptors
-```
-
-#### 7. Backend Connection Errors
-
-**Error:**
-```json
-{"level":"ERROR","msg":"failed to connect to backend","backend":"mail.example.com:587"}
-```
-
-**Debug checklist:**
-
-1. Test backend connectivity:
-```bash
-telnet mail.example.com 587
-```
-
-2. Check DNS resolution:
-```bash
-nslookup mail.example.com
-```
-
-3. Verify firewall rules:
-```bash
-# Check if port is accessible
-nc -zv mail.example.com 587
-```
-
-4. Check backend authentication:
-```bash
-# Test manual auth
-openssl s_client -starttls smtp -connect mail.example.com:587
-# Then:
-# EHLO test
-# AUTH PLAIN base64(username:password)
-```
+1. Reduce ClickHouse buffer size
+2. Reduce delivery worker count
+3. Enable spool cleanup
+4. Check for memory leaks in logs
 
 ### Debug Logging
 
-Enable debug logging for detailed troubleshooting:
+Enable debug logging:
 
 ```yaml
 observability:
   log_level: "debug"
 ```
 
-**Filter debug logs for a specific component:**
+Filter debug logs:
 ```bash
 # Auth debugging
-./smtp-edge-proxy -config config.yaml | jq 'select(.msg | contains("auth"))'
+./submitter-smtp-daemon | jq 'select(.component=="auth")'
 
-# Relay debugging
-./smtp-edge-proxy -config config.yaml | jq 'select(.msg | contains("relay"))'
+# Delivery debugging
+./submitter-smtp-daemon | jq 'select(.component=="delivery")'
 
-# TLS debugging
-./smtp-edge-proxy -config config.yaml | jq 'select(.msg | contains("tls") or contains("cert"))'
+# Rate limit debugging
+./submitter-smtp-daemon | jq 'select(.component=="ratelimit")'
 ```
-
-### Performance Troubleshooting
-
-**Check metrics for bottlenecks:**
-
-```bash
-# High authentication failures
-curl -s http://localhost:9090/metrics | grep smtp_proxy_auth_failures_total
-
-# High relay failures
-curl -s http://localhost:9090/metrics | grep smtp_proxy_relay_failures_total
-
-# Long connection durations
-curl -s http://localhost:9090/metrics | grep smtp_proxy_connection_duration_seconds
-```
-
-**Monitor active connections:**
-```bash
-watch -n 5 'curl -s http://localhost:9090/metrics | grep smtp_proxy_current_connections'
-```
-
-## Architecture
-
-### Request Flow
-
-```
-┌─────────┐         ┌──────────────────┐         ┌─────────────┐
-│ Client  │────────▶│  SMTP Edge Proxy │────────▶│   Backend   │
-│         │  TLS    │                  │  Auth + │   Server    │
-│ :587/465│         │  • TLS Term      │  Relay  │             │
-└─────────┘         │  • SNI Selection │         └─────────────┘
-                    │  • Authentication│
-                    │  • Rate Limiting │
-                    │  • Header Inject │
-                    │  • DSN Validation│
-                    └──────────────────┘
-```
-
-**Step-by-step flow:**
-
-1. **Client connects** to proxy on port 587 (STARTTLS) or 465 (implicit TLS)
-2. **TLS negotiation** with SNI-based certificate selection
-3. **Client sends EHLO** - proxy advertises capabilities
-4. **Client authenticates** - proxy validates credentials against backend
-5. **Backend connection established** and authenticated (kept open)
-6. **Client sends MAIL FROM** - DSN parameters validated and stored
-7. **Client sends RCPT TO** - DSN parameters validated, recipient limit checked
-8. **Client sends DATA** - message received from client
-9. **Proxy injects headers** (X-Original-Client-IP, X-Original-Auth-User, etc.)
-10. **Message relayed** via authenticated backend connection with DSN parameters
-11. **Backend response** returned to client
-12. **Client disconnects** - backend connection closed
-
-### Key Design: Authenticated Connection Reuse
-
-The proxy uses a **single authenticated connection** per session:
-
-- Client authenticates → proxy authenticates to backend with **user's credentials**
-- Backend connection **kept open** for the entire session
-- All messages in the session use the **same authenticated connection**
-- Backend sees the **original user's identity**
-- Backend can apply **per-user rules** (quotas, filters, policies)
-
-**Benefits:**
-- Backend authorization works correctly
-- No separate relay authentication needed
-- Better performance (connection reuse)
-- Simplified security model
-- Full audit trail
-
-### Component Architecture
-
-```
-smtp-edge-proxy/
-├── cmd/main.go              # Application entry, server setup
-├── internal/
-│   ├── auth/                # Backend authentication
-│   │   └── auth.go          # Validates creds, returns connection
-│   ├── backend/             # Per-user backend selection
-│   │   └── selector.go      # CSV-based routing logic
-│   ├── config/              # Configuration management
-│   │   └── config.go        # YAML + env var handling
-│   ├── metrics/             # Prometheus metrics
-│   │   └── metrics.go       # Metric definitions
-│   ├── proxy/               # SMTP protocol handler
-│   │   └── backend.go       # Session management, SMTP commands
-│   ├── ratelimit/           # Rate limiting
-│   │   └── ratelimit.go     # Per-IP and per-user tracking
-│   ├── relay/               # Message forwarding
-│   │   └── relay.go         # Header injection, relay logic
-│   └── tlsmgr/              # TLS certificate management
-│       └── manager.go       # SNI selection, hot reload
-```
-
-### Concurrency Model
-
-- **Goroutine-per-connection** architecture
-- Each client connection runs in its own goroutine
-- Non-blocking I/O for efficient resource usage
-- Thread-safe components (TLS manager, rate limiter, metrics)
-- No shared state between sessions
-
-**Expected throughput:**
-- Concurrent connections: 1,000+
-- Authentication rate: 100-200/sec (backend limited)
-- Message relay rate: 50-100/sec (backend limited)
-
-**Scaling:** Run multiple instances behind a load balancer (HAProxy, Nginx) for higher throughput.
 
 ## Development
 
@@ -1136,32 +907,33 @@ smtp-edge-proxy/
 ```
 .
 ├── cmd/
-│   └── main.go                    # Application entry point
+│   └── outbound/
+│       └── main.go              # Application entry point
 ├── internal/
-│   ├── auth/                      # Authentication verification
-│   ├── backend/                   # Per-user backend routing
-│   ├── config/                    # Configuration management
-│   ├── metrics/                   # Prometheus metrics
-│   ├── proxy/                     # SMTP server backend
-│   ├── ratelimit/                 # Rate limiting
-│   ├── relay/                     # Message relay
-│   └── tlsmgr/                    # TLS/SNI certificate management
-├── configs/
-│   └── config.example.yaml        # Example configuration
-├── certs/                         # TLS certificates (*.pem)
-├── docs/                          # Documentation
-│   ├── DSN-IMPLEMENTATION.md
-│   ├── HEADERS.md
-│   ├── LOGGING.md
-│   ├── CONFIG-STATUS.md
-│   ├── QUICK-START.md
-│   └── PERFORMANCE-ANALYSIS.md
-├── Makefile                       # Build automation
-├── Dockerfile                     # Container image
-├── go.mod                         # Go module definition
-├── go.sum                         # Dependency checksums
-├── CLAUDE.md                      # AI development guide
-└── README.md                      # This file
+│   ├── auth/                    # Authentication (Redis, IP)
+│   ├── clickhouse/              # ClickHouse event logger
+│   ├── config/                  # Configuration management
+│   ├── db/                      # SQLite database
+│   ├── dedup/                   # Message deduplication
+│   ├── delivery/                # Delivery workers
+│   ├── logger/                  # Structured logging
+│   ├── metrics/                 # Prometheus metrics
+│   ├── parser/                  # MIME parser
+│   ├── queue/                   # Delivery queue
+│   ├── ratelimit/               # Rate limiting
+│   ├── smtpserver/              # SMTP server
+│   ├── spool/                   # Message spooling
+│   └── tlsmgr/                  # TLS certificate management
+├── deployments/
+│   ├── docker-compose.yml       # Development infrastructure
+│   └── clickhouse/
+│       └── init.sql             # ClickHouse schema
+├── config.example.yaml          # Example configuration
+├── Makefile                     # Build automation
+├── Dockerfile                   # Container image
+├── go.mod                       # Go module
+├── CLAUDE.md                    # AI development guide
+└── README.md                    # This file
 ```
 
 ### Building
@@ -1170,296 +942,95 @@ smtp-edge-proxy/
 # Standard build
 make build
 
-# Build with race detector (for development)
-make build-race
+# Build with race detector
+go build -race -o submitter-smtp-daemon ./cmd/outbound
 
 # Cross-compile for Linux
 GOOS=linux GOARCH=amd64 make build
-
-# Build Docker image
-make docker-build
 ```
 
 ### Testing
 
 ```bash
 # Run unit tests
-make test
+go test ./...
 
 # Run with coverage
-make test-coverage
+go test -cover ./...
 
-# View coverage in browser
+# Generate coverage report
+go test -coverprofile=coverage.out ./...
 go tool cover -html=coverage.out
 
-# Lint code
-make lint
-
-# Run end-to-end tests
-python3 test-proxy-e2e.py
-```
-
-### Code Quality
-
-```bash
-# Format code
-make fmt
-
 # Run linters
-make lint
-
-# Static analysis
-go vet ./...
-
-# Check for common issues
-staticcheck ./...
+golangci-lint run
 ```
-
-### Dependencies
-
-Built with:
-- **Go 1.24**
-- `github.com/emersion/go-smtp` - SMTP protocol library
-- `github.com/fsnotify/fsnotify` - File system notifications
-- `github.com/prometheus/client_golang` - Prometheus metrics
-- `gopkg.in/yaml.v3` - YAML configuration
-- `log/slog` - Structured logging (stdlib)
 
 ### Adding New Features
-
-**To add a new SMTP capability:**
-
-1. Add config field in `internal/config/config.go`:
-```go
-type SMTPCapabilities struct {
-    NewFeature bool `yaml:"new_feature"`
-    // ...
-}
-```
-
-2. Set capability in `cmd/main.go`:
-```go
-if cfg.SMTP.Capabilities.NewFeature {
-    s.EnableNewFeature = true
-}
-```
-
-3. Implement handling in `internal/proxy/backend.go` if needed
-
-**To add a new metric:**
-
-1. Define in `internal/metrics/metrics.go`:
-```go
-var NewMetricCounter = promauto.NewCounter(prometheus.CounterOpts{
-    Name: "smtp_proxy_new_metric_total",
-    Help: "Description of new metric",
-})
-```
-
-2. Instrument code where metric should be recorded:
-```go
-metrics.NewMetricCounter.Inc()
-```
 
 **To add a new configuration option:**
 
 1. Add to struct in `internal/config/config.go`
-2. Add to `configs/config.example.yaml`
-3. Add environment variable override in `applyEnvOverrides()` (optional)
-4. Update validation in `Validate()` method
+2. Add to `config.example.yaml`
+3. Add validation in `Validate()` method
+4. Add environment variable override in `applyEnvOverrides()`
 
-## Possible Fixes/TODOs
+**To add a new metric:**
 
-### Known Issues
+1. Define in `internal/metrics/metrics.go`
+2. Initialize in `New()` function
+3. Instrument code where metric should be recorded
 
-1. **Backend STARTTLS Timeout Issue**
-   - **Status**: Known library limitation
-   - **Issue**: The `go-smtp` library's `DialStartTLS()` has timeout handling issues
-   - **Impact**: Authentication may hang 10-15 seconds then timeout
-   - **Workaround**: Set `use_starttls: false` for backend connections
-   - **Long-term fix**: Switch to different SMTP library or implement custom STARTTLS
+**To add a new pipeline stage:**
 
-2. **Idle Timeout Not Applied**
-   - **Status**: Configuration bug
-   - **Issue**: `idle_timeout` field exists in config but is not connected to SMTP server
-   - **Impact**: Idle connections don't timeout as configured
-   - **Fix needed**: Add `s.MaxIdleSeconds = int(cfg.Limits.IdleTimeout.Seconds())` in `cmd/main.go`
-   - **Priority**: High
+1. Add stage constant in `internal/spool/spool.go`
+2. Create stage directory in spool
+3. Add processing logic in appropriate component
+4. Update metrics and logging
 
-3. **Connection Limits Not Enforced**
-   - **Status**: Not implemented
-   - **Issue**: `max_connections` and `max_connections_per_ip` have no effect
-   - **Impact**: No enforcement of connection limits
-   - **Workaround**: Use OS limits (`ulimit`) or reverse proxy rate limiting
-   - **Fix needed**: Implement connection tracking and rejection logic
-   - **Priority**: Medium
+## Implementation Status
 
-4. **ARC Headers Not Implemented**
-   - **Status**: Configuration exists but feature not implemented
-   - **Issue**: `arc_enabled` config field has no effect
-   - **Impact**: Low - ARC is an advanced email authentication feature
-   - **Fix needed**: Implement ARC header generation and DKIM signing integration
-   - **Priority**: Low
+### ✅ Phase 1: Foundation (Completed)
+- SMTP server with TLS/SNI support
+- Redis and IP-based authentication
+- Multi-level rate limiting with Redis
+- 8-stage atomic file spooling
+- TLS certificate management with hot reload
+- Comprehensive metrics and logging
+- Configuration system with env var overrides
 
-### Bugs to Fix
+### ✅ Phase 2: Message Processing (Completed)
+- MIME message parser with metadata extraction
+- SHA256-based deduplication with Redis
+- SQLite queue database with schema
+- Delivery queue with state management
+- Buffered ClickHouse event logger
+- Delivery worker pool with MX lookup
+- Retry logic with configurable schedule
+- Temporary vs permanent failure handling
 
-1. **Fix idle timeout not being applied**
-   ```go
-   // In cmd/main.go, add after WriteTimeout line:
-   s.MaxIdleSeconds = int(cfg.Limits.IdleTimeout.Seconds())
-   ```
+### 🚧 Phase 3: Advanced Features (Planned)
+- DKIM signing with per-domain keys
+- S3 message archival with date partitioning
+- Message modification engine (headers, content)
+- SPF/DKIM output validation
+- Advanced filtering and policy engine
+- Webhook notifications for events
+- Admin API for queue management
 
-2. **Add connection limit enforcement**
-   - Implement atomic counter for active connections
-   - Check against `max_connections` before accepting new connection
-   - Implement per-IP connection tracking for `max_connections_per_ip`
+## Performance Expectations
 
-3. **Improve error handling for backend connection failures**
-   - Add circuit breaker pattern for failing backends
-   - Implement exponential backoff for retries
-   - Better error messages to clients
+**Single Instance:**
+- Concurrent connections: 1,000+
+- Message acceptance: 100-200 msg/sec
+- Delivery throughput: 50-100 msg/sec (MX limited)
+- Average latency: <100ms (acceptance)
 
-4. **Backend connection pool not implemented**
-   - Config has `pool_enabled: false` but feature doesn't exist
-   - Would significantly improve performance under load
-   - Requires connection lifecycle management
-
-### Testing Gaps
-
-1. **Add unit tests for:**
-   - Rate limiter edge cases
-   - DSN parameter validation
-   - Backend selector priority logic
-   - TLS certificate hot reload
-
-2. **Add integration tests for:**
-   - Multiple concurrent connections
-   - Backend failure scenarios
-   - Rate limit enforcement
-   - SNI certificate selection
-
-3. **Add load tests for:**
-   - Sustained message throughput
-   - Connection pool exhaustion
-   - Memory usage under load
-
-## Enhancement Suggestions
-
-### High Priority
-
-1. **Connection Pooling to Backend**
-   - Reuse backend connections across sessions
-   - Significant performance improvement
-   - Reduces backend connection count
-   - Implementation complexity: High
-
-2. **Circuit Breaker for Backend Failures**
-   - Stop sending requests to failing backends
-   - Automatic recovery attempts
-   - Better error handling for clients
-   - Implementation complexity: Medium
-
-3. **Health Check for Backends**
-   - Periodic backend connectivity checks
-   - Mark unhealthy backends as down
-   - Automatic failover to healthy backends
-   - Implementation complexity: Medium
-
-4. **Configuration Reload Without Restart**
-   - Hot reload of config.yaml (like certificate reload)
-   - Update backends.csv without restart
-   - Zero-downtime configuration changes
-   - Implementation complexity: Medium
-
-### Medium Priority
-
-5. **Redis-based Rate Limiting**
-   - Distributed rate limiting across multiple instances
-   - Persistent rate limit state
-   - Better accuracy under load
-   - Implementation complexity: Medium
-
-6. **Message Queue for Offline Backend**
-   - Queue messages when backend is unavailable
-   - Retry delivery automatically
-   - Reduces client-visible failures
-   - Implementation complexity: High
-
-7. **Per-Backend Metrics**
-   - Track auth/relay success per backend
-   - Monitor backend latency
-   - Identify problematic backends
-   - Implementation complexity: Low
-
-8. **DKIM Signing**
-   - Sign outgoing messages with DKIM
-   - Improve email deliverability
-   - Per-domain key management
-   - Implementation complexity: High
-
-9. **Greylisting Support**
-   - Implement greylisting for spam reduction
-   - Configurable greylist duration
-   - Whitelist for known good senders
-   - Implementation complexity: Medium
-
-10. **Webhook Notifications**
-    - Send webhooks for specific events
-    - Failed authentications, rate limit hits, etc.
-    - Integration with monitoring systems
-    - Implementation complexity: Low
-
-### Low Priority
-
-11. **Web UI for Configuration**
-    - Web-based configuration editor
-    - Real-time metrics dashboard
-    - Backend routing management
-    - Implementation complexity: High
-
-12. **LDAP/Active Directory Integration**
-    - Alternative authentication backend
-    - Support for corporate directories
-    - Group-based routing rules
-    - Implementation complexity: High
-
-13. **Message Filtering Rules**
-    - Content-based routing
-    - Block/allow lists for recipients
-    - Size-based routing
-    - Implementation complexity: Medium
-
-14. **OpenTelemetry Tracing**
-    - Full distributed tracing support
-    - Integration with Jaeger/Zipkin
-    - Request flow visualization
-    - Implementation complexity: Medium
-
-15. **IPv6 Support Improvements**
-    - Better IPv6 address handling
-    - IPv6-specific rate limiting
-    - IPv6 prefix matching in IP filters
-    - Implementation complexity: Low
-
-### Performance Optimizations
-
-16. **Worker Pool Architecture**
-    - Alternative to goroutine-per-connection
-    - Better for >10,000 concurrent connections
-    - Lower memory footprint
-    - Implementation complexity: High
-
-17. **Async Logging**
-    - Non-blocking log writes
-    - Buffered log output
-    - Reduces latency impact
-    - Implementation complexity: Medium
-
-18. **Zero-Copy Message Streaming**
-    - Reduce memory allocations during relay
-    - Direct streaming from client to backend
-    - Lower memory usage
-    - Implementation complexity: High
+**Scaling:**
+- Deploy multiple instances behind load balancer
+- Shared Redis for rate limiting and deduplication
+- Shared ClickHouse for centralized logging
+- Independent delivery queues per instance
 
 ## License
 
@@ -1467,25 +1038,28 @@ Copyright © 2025 InteSys/EmailProfissional
 
 ## Support
 
-For issues, questions, and development guidance:
-- Check the [documentation](docs/)
+For issues and questions:
 - Review [CLAUDE.md](CLAUDE.md) for development guide
-- Check logs with JSON filtering: `./smtp-edge-proxy | jq 'select(.level=="ERROR")'`
-- Enable debug logging: Set `observability.log_level: "debug"` in config
+- Check logs with JSON filtering
+- Enable debug logging
+- Monitor Prometheus metrics
+- Query ClickHouse events for troubleshooting
 
 ## Contributing
 
-Contributions are welcome! Please:
+Contributions welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Write tests for new functionality
-4. Ensure all tests pass: `make test`
-5. Run linters: `make lint`
+4. Ensure all tests pass
+5. Run linters
 6. Submit a pull request
 
 ## Acknowledgments
 
 Built with:
-- [go-smtp](https://github.com/emersion/go-smtp) by Simon Ser
-- [fsnotify](https://github.com/fsnotify/fsnotify)
-- [Prometheus Go client](https://github.com/prometheus/client_golang)
+- [go-smtp](https://github.com/emersion/go-smtp) - SMTP protocol library
+- [zerolog](https://github.com/rs/zerolog) - Structured logging
+- [go-redis](https://github.com/redis/go-redis) - Redis client
+- [Prometheus Go client](https://github.com/prometheus/client_golang) - Metrics
+- [fsnotify](https://github.com/fsnotify/fsnotify) - File system notifications
