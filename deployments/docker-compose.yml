@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # Redis - User authentication and rate limiting
+  redis:
+    image: redis:7-alpine
+    container_name: outbound-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - outbound-net
+
+  # ClickHouse - Event logging and analytics
+  clickhouse:
+    image: clickhouse/clickhouse-server:23-alpine
+    container_name: outbound-clickhouse
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native interface
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql
+    environment:
+      CLICKHOUSE_DB: outbound
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - outbound-net
+
+  # MinIO - S3-compatible storage for message archival
+  minio:
+    image: minio/minio:latest
+    container_name: outbound-minio
+    ports:
+      - "9090:9000"  # API
+      - "9091:9001"  # Console
+    volumes:
+      - minio-data:/data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    networks:
+      - outbound-net
+
+  # MinIO bucket initialization
+  minio-init:
+    image: minio/mc:latest
+    container_name: outbound-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb local/outbound-archive --ignore-existing;
+      mc anonymous set download local/outbound-archive;
+      echo 'Bucket created successfully';
+      "
+    networks:
+      - outbound-net
+
+volumes:
+  redis-data:
+  clickhouse-data:
+  minio-data:
+
+networks:
+  outbound-net:
+    driver: bridge

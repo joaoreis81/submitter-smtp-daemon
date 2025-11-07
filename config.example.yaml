@@ -1,82 +1,241 @@
-# SMTP Edge Proxy Configuration Example
+# SMTP Outbound Daemon Configuration Example
+# Copy to config.yaml and adjust for your environment
 
-# Listener configuration
-listeners:
-  submission: ":587"  # STARTTLS port
-  smtps: ":465"       # Implicit TLS port
+# Server identity
+server:
+  hostname: "mail.example.com"
+  version: "1.0.0"
+
+# SMTP listeners
+smtp:
+  listeners:
+    # STARTTLS on port 587 (standard submission)
+    - ip: "0.0.0.0"
+      port: 587
+      mode: "starttls"
+      require_tls: true
+      require_auth: true
+
+    # Implicit TLS on port 465 (legacy SMTPS)
+    - ip: "0.0.0.0"
+      port: 465
+      mode: "implicit_tls"
+      require_auth: true
+
+    # Plaintext on port 25 (trusted relay - optional)
+    - ip: "0.0.0.0"
+      port: 25
+      mode: "plaintext"
+      require_auth: false
+
+  max_message_size: 50000000  # 50MB
+  max_recipients: 100
+  read_timeout: 120s
+  write_timeout: 120s
+
+  # DSN (Delivery Status Notifications) support
+  dsn:
+    enabled: true
+    max_envid_length: 100
 
 # TLS configuration
 tls:
-  min_version: "1.2"  # Minimum TLS version: 1.0, 1.1, 1.2, 1.3
-  certs_dir: "certs"  # Directory containing .pem certificate files
-  cipher_suites: []   # Empty = use Go defaults
-  prefer_server_cipher: true
+  certs_dir: "./certs"
+  min_version: "1.2"
+  prefer_server_ciphers: true
+  # cipher_suites: []  # Empty = use Go defaults
 
-# Backend authentication server configuration
-backend:
-  host: "172.23.20.40"      # Backend SMTP server for authentication
-  port: 587                  # Backend port
-  use_starttls: true         # Use STARTTLS
-  implicit_tls: false        # Use implicit TLS
-  skip_tls_verify: false     # Skip TLS certificate verification
-  timeout: 10s               # Connection timeout
+# Authentication
+auth:
+  # Redis user database
+  redis:
+    enabled: true
+    addresses:
+      - "localhost:6379"
+    password: ""
+    db: 0
+    pool_size: 10
 
-# Relay backend configuration
-relay:
-  host: "172.23.20.40"       # Backend SMTP server for relaying
-  port: 25                    # Backend port
-  use_starttls: false         # Use STARTTLS
-  implicit_tls: false         # Use implicit TLS
-  skip_tls_verify: false      # Skip TLS certificate verification
-  timeout: 30s                # Connection timeout
-  pool_enabled: false         # Enable connection pooling
-  pool_max_idle: 10           # Max idle connections in pool
-  pool_max_active: 100        # Max active connections in pool
+  # IP-based authentication (allow relay from specific IPs)
+  ip_allowlist:
+    enabled: false
+    ips:
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
 
-# SMTP server configuration
-smtp:
-  banner_hostname: "edge-smtp.intesys.io"
-  require_tls: true           # Require TLS before AUTH
-  allow_insecure_auth: false  # Allow AUTH without TLS
+# Rate limiting
+rate_limit:
+  enabled: true
 
-  # SMTP capabilities
-  capabilities:
-    pipelining: true
-    size: true
-    size_limit: 150000000     # 150MB
-    enhanced_status_codes: true
-    eight_bit_mime: true
-    dsn: true
-    chunking: true
-    smtputf8: true
-    binary_mime: true
+  # Per-user limits
+  user:
+    messages_per_hour: 1000
+    recipients_per_hour: 10000
 
-# Security configuration
-security:
-  ip_allow_list: []           # IP addresses/CIDRs allowed (empty = all)
-  ip_deny_list: []            # IP addresses/CIDRs denied
-  rate_limit_enabled: true
-  rate_limit_per_ip: 10       # Failed auth attempts per IP
-  rate_limit_per_user: 100    # Failed auth attempts per user
-  rate_limit_window: 1m       # Rate limit window
-  arc_enabled: false          # Enable ARC/DMARC helper headers
+  # Per-IP limits
+  ip:
+    connections_per_minute: 60
+    failed_auth_per_hour: 10
 
-# Connection limits
-limits:
-  max_recipients: 200         # Max recipients per message
-  max_connections: 1000       # Max total connections
-  max_connections_per_ip: 10  # Max connections per IP
-  read_timeout: 120s          # Read timeout
-  write_timeout: 120s         # Write timeout
-  idle_timeout: 300s          # Idle timeout
+  # Global limits
+  global:
+    messages_per_second: 100
+    concurrent_connections: 1000
 
-# Observability configuration
+# Message spooling
+spool:
+  base_path: "/var/spool/outbound"
+
+  # Retention for each stage
+  retention:
+    incoming: 1h
+    parsed: 1h
+    filtered: 1h
+    modified: 1h
+    signed: 1h
+    delivering: 24h
+    done: 24h
+    failed: 168h  # 7 days
+
+# Message deduplication
+deduplication:
+  enabled: true
+  window: 24h
+  storage: "redis"  # redis or memory
+
+# Message modification
+modification:
+  enabled: false
+  rules_reload_interval: 30s
+
+  profiles:
+    - name: "marketing"
+      selector: "@marketing.example.com"
+      add_headers:
+        - name: "X-Mailer"
+          value: "OutboundDaemon/1.0"
+        - name: "List-Unsubscribe"
+          value: "<mailto:unsubscribe@example.com>"
+      inject_footer:
+        html: "<p><small>To unsubscribe, click <a href='https://example.com/unsub'>here</a></small></p>"
+        text: "\n\nTo unsubscribe: https://example.com/unsub"
+
+# DKIM signing
+dkim:
+  enabled: true
+  keys_dir: "./dkim"
+  canonicalization_header: "relaxed"
+  canonicalization_body: "relaxed"
+
+  # Per-domain configuration
+  domains:
+    - domain: "example.com"
+      selector: "default"
+      private_key: "./dkim/example.com.key"
+
+# Output validation (optional)
+output_validation:
+  spf_check: false      # Verify sending IP is authorized
+  dkim_verify: true     # Verify own signature after signing
+
+# Delivery settings
+delivery:
+  workers: 16
+
+  # Retry schedule (exponential backoff)
+  retry_schedule:
+    - 1m
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+    - 8h
+    - 24h
+
+  max_attempts: 7
+
+  # Connection pooling
+  connection_pool:
+    enabled: true
+    max_per_host: 10
+    idle_timeout: 5m
+
+  # MX lookup caching
+  mx_cache:
+    enabled: true
+    ttl: 1h
+
+  # TLS for outbound delivery
+  tls:
+    enabled: true
+    verify: true
+    min_version: "1.2"
+
+# SQLite database
+database:
+  path: "./queue.db"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime: 5m
+
+# ClickHouse event logging
+clickhouse:
+  addresses:
+    - "localhost:9000"
+  database: "outbound"
+  username: "default"
+  password: ""
+
+  # Buffering settings
+  buffer_size: 100
+  flush_interval: 10s
+  retry_max_interval: 5m
+  compression: true
+
+# S3 archival
+s3:
+  enabled: false
+  endpoint: "l8h6.la.idrivee2-48.com"  # iDrive E2
+  region: "us-east-1"
+  bucket: "outbound-archive"
+  access_key_id: "${OUTBOUND_S3_ACCESS_KEY_ID}"
+  secret_access_key: "${OUTBOUND_S3_SECRET_ACCESS_KEY}"
+  path_prefix: "emails"
+  use_ssl: true
+
+  # Archive both original and modified messages
+  archive_original: true
+  archive_final: true
+
+# Worker pool sizes
+workers:
+  parse: 4
+  modify: 4
+  sign: 4
+  delivery: 16
+  archive: 4
+
+# Observability
 observability:
-  log_level: "info"           # debug, info, warn, error
-  log_format: "json"          # json or text
+  log_level: "info"      # debug, info, warn, error
+  log_format: "json"     # json, console
+
+  # Prometheus metrics
   metrics_enabled: true
-  metrics_addr: ":9090"       # Prometheus metrics endpoint
-  health_addr: ":8080"        # Health check endpoint
-  tracing_enabled: false
-  tracing_endpoint: ""        # OpenTelemetry collector endpoint
-  tracing_service_name: "smtp-edge-proxy"
+  metrics_listen: ":9090"
+
+  # Health checks
+  health_listen: ":8080"
+
+# Redis (general purpose)
+redis:
+  addresses:
+    - "localhost:6379"
+  password: ""
+  db: 0
+  pool_size: 50
+  max_retries: 3
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
