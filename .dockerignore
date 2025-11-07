@@ -1,0 +1,40 @@
+# Git
+.git
+.gitignore
+
+# Build artifacts
+smtp-edge-proxy
+*.test
+*.out
+coverage.html
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.log
+/tmp
+*.tmp
+
+# Documentation
+*.md
+docs/
+
+# Test files
+*_test.go
+test-*.py
+test-*.sh
+
+# Kubernetes
+k8s/
+
+# Config examples (use volumes instead)
+config-test.yaml
+config.yaml

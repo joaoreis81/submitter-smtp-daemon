@@ -1,0 +1,85 @@
+# Binary output
+smtp-edge-proxy
+/smtp-edge-proxy
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go test coverage
+coverage.out
+coverage.html
+*.coverprofile
+
+# Configuration files (may contain secrets)
+config.yaml
+/config.yaml
+
+# TLS certificates and keys
+certs/
+/certs/
+*.pem
+*.key
+*.crt
+*.csr
+
+# Backend routing configuration (may contain sensitive info)
+backends.csv
+/backends.csv
+
+# Log files
+*.log
+/logs/
+*.log.*
+
+# Temporary files
+tmp/
+/tmp/
+temp/
+/temp/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Test outputs
+/test-results/
+/helper-scripts/*.log
+
+# Unused/build artifacts
+/unused/
+
+# Go workspace
+go.work
+go.work.sum
+
+# Vendor directory (if using)
+/vendor/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini

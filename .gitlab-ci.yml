@@ -1,0 +1,55 @@
+stages:
+  - build
+  - test
+
+variables:
+  APP_VERSION: "v0.2.0"
+  GO_VERSION: "1.24"
+
+# Build Docker image
+build-smtp-edge-proxy:
+  stage: build
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+  script:
+    - BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    - docker build --build-arg VERSION=$APP_VERSION --build-arg COMMIT=$CI_COMMIT_SHA --build-arg BUILD_DATE=$BUILD_DATE -t $CI_REGISTRY_IMAGE/smtp-edge-proxy:$CI_COMMIT_SHA -t $CI_REGISTRY_IMAGE/smtp-edge-proxy:$APP_VERSION -t $CI_REGISTRY_IMAGE/smtp-edge-proxy:latest .
+    - docker push $CI_REGISTRY_IMAGE/smtp-edge-proxy:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE/smtp-edge-proxy:$APP_VERSION
+    - docker push $CI_REGISTRY_IMAGE/smtp-edge-proxy:latest
+  only:
+    - main
+    - tags
+
+# Build binary for releases
+build-binary:
+  stage: build
+  script:
+    - make build VERSION=$APP_VERSION
+  artifacts:
+    paths:
+      - smtp-edge-proxy
+    expire_in: 1 week
+  only:
+    - tags
+
+# Run tests
+test:
+  stage: test
+  script:
+    - make test
+  coverage: '/coverage: \d+\.\d+% of statements/'
+  allow_failure: true
+  only:
+    - merge_requests
+    - main
+
+# Lint code
+lint:
+  stage: test
+  script:
+    - make lint
+  allow_failure: true
+  only:
+    - merge_requests
+    - main
